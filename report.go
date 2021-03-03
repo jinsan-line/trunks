@@ -7,39 +7,66 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"time"
 
 	trunks "github.com/straightdave/trunks/lib"
 )
 
+const reportUsage = `Usage: trunks report [options] [<file>...]
+
+Outputs a report of attack results.
+
+Arguments:
+  <file>  A file with trunks attack results encoded with one of
+          the supported encodings (gob | json | csv) [default: stdin]
+
+Options:
+  --type    Which report type to generate (text | json | hist[buckets] | hdrplot).
+            [default: text]
+
+  --every   Write the report to --output at every given interval (e.g 100ms)
+            The default of 0 means the report will only be written after
+            all results have been processed. [default: 0]
+
+  --output  Output file [default: stdout]
+
+Examples:
+  echo "GET http://:80" | trunks attack -rate=10/s > results.gob
+  echo "GET http://:80" | trunks attack -rate=100/s | trunks encode > results.json
+  trunks report results.*
+`
+
 func reportCmd() command {
 	fs := flag.NewFlagSet("trunks report", flag.ExitOnError)
-	reporter := fs.String("reporter", "text", "Reporter [text, json, plot, hist[buckets]]")
-	inputs := fs.String("inputs", "stdin", "Input files (comma separated)")
+	typ := fs.String("type", "text", "Report type to generate [text, json, hist[buckets], hdrplot]")
+	every := fs.Duration("every", 0, "Report interval")
 	output := fs.String("output", "stdout", "Output file")
+	buckets := fs.String("buckets", "", "Histogram buckets, e.g.: \"[0,1ms,10ms]\"")
+
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, reportUsage)
+	}
+
 	return command{fs, func(args []string) error {
 		fs.Parse(args)
-		return report(*reporter, *inputs, *output)
+		files := fs.Args()
+		if len(files) == 0 {
+			files = append(files, "stdin")
+		}
+		return report(files, *typ, *output, *every, *buckets)
 	}}
 }
 
-// report validates the report arguments, sets up the required resources
-// and writes the report
-func report(reporter, inputs, output string) error {
-	if len(reporter) < 4 {
-		return fmt.Errorf("bad reporter: %s", reporter)
+func report(files []string, typ, output string, every time.Duration, bucketsStr string) error {
+	if len(typ) < 4 {
+		return fmt.Errorf("invalid report type: %s", typ)
 	}
 
-	files := strings.Split(inputs, ",")
-	srcs := make([]io.Reader, len(files))
-	for i, f := range files {
-		in, err := file(f, false)
-		if err != nil {
-			return err
-		}
-		defer in.Close()
-		srcs[i] = in
+	dec, mc, err := decoder(files)
+	defer mc.Close()
+	if err != nil {
+		return err
 	}
-	dec := trunks.NewDecoder(srcs...)
 
 	out, err := file(output, true)
 	if err != nil {
@@ -52,37 +79,65 @@ func report(reporter, inputs, output string) error {
 		report trunks.Report
 	)
 
-	switch reporter[:4] {
+	switch typ {
+	case "plot":
+		return fmt.Errorf("The plot reporter has been deprecated and succeeded by the trunks plot command")
 	case "text":
 		var m trunks.Metrics
 		rep, report = trunks.NewTextReporter(&m), &m
 	case "json":
 		var m trunks.Metrics
+		if bucketsStr != "" {
+			m.Histogram = &trunks.Histogram{}
+			if err := m.Histogram.Buckets.UnmarshalText([]byte(bucketsStr)); err != nil {
+				return err
+			}
+		}
 		rep, report = trunks.NewJSONReporter(&m), &m
-	case "plot":
-		var rs trunks.Results
-		rep, report = trunks.NewPlotReporter("Vegeta Plot", &rs), &rs
-	case "hist":
-		if len(reporter) < 6 {
-			return fmt.Errorf("bad buckets: '%s'", reporter[4:])
-		}
-		var hist trunks.Histogram
-		if err := hist.Buckets.UnmarshalText([]byte(reporter[4:])); err != nil {
-			return err
-		}
-		rep, report = trunks.NewHistogramReporter(&hist), &hist
+	case "hdrplot":
+		var m trunks.Metrics
+		rep, report = trunks.NewHDRHistogramPlotReporter(&m), &m
 	default:
-		return fmt.Errorf("unknown reporter: %q", reporter)
+		switch {
+		case strings.HasPrefix(typ, "hist"):
+			var hist trunks.Histogram
+			if bucketsStr == "" { // Old way
+				if len(typ) < 6 {
+					return fmt.Errorf("bad buckets: '%s'", typ[4:])
+				}
+				bucketsStr = typ[4:]
+			}
+			if err := hist.Buckets.UnmarshalText([]byte(bucketsStr)); err != nil {
+				return err
+			}
+			rep, report = trunks.NewHistogramReporter(&hist), &hist
+		default:
+			return fmt.Errorf("unknown report type: %q", typ)
+		}
 	}
 
 	sigch := make(chan os.Signal, 1)
 	signal.Notify(sigch, os.Interrupt)
 
+	var ticks <-chan time.Time
+	if every > 0 {
+		ticker := time.NewTicker(every)
+		defer ticker.Stop()
+		ticks = ticker.C
+	}
+
+	rc, _ := report.(trunks.Closer)
 decode:
 	for {
 		select {
 		case <-sigch:
 			break decode
+		case <-ticks:
+			if err = clear(out); err != nil {
+				return err
+			} else if err = writeReport(rep, rc, out); err != nil {
+				return err
+			}
 		default:
 			var r trunks.Result
 			if err = dec.Decode(&r); err != nil {
@@ -91,13 +146,24 @@ decode:
 				}
 				return err
 			}
+
 			report.Add(&r)
 		}
 	}
 
-	if c, ok := report.(trunks.Closer); ok {
-		c.Close()
-	}
+	return writeReport(rep, rc, out)
+}
 
-	return rep.Report(out)
+func writeReport(r trunks.Reporter, rc trunks.Closer, out io.Writer) error {
+	if rc != nil {
+		rc.Close()
+	}
+	return r.Report(out)
+}
+
+func clear(out io.Writer) error {
+	if f, ok := out.(*os.File); ok && f == os.Stdout {
+		return clearScreen()
+	}
+	return nil
 }

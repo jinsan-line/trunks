@@ -1,6 +1,7 @@
 package trunks
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 	"time"
@@ -35,6 +36,25 @@ func (h *Histogram) Add(r *Result) {
 	h.Counts[i]++
 }
 
+// MarshalJSON returns a JSON encoding of the buckets and their counts.
+func (h *Histogram) MarshalJSON() ([]byte, error) {
+	var buf bytes.Buffer
+
+	// Custom marshalling to guarantee order.
+	buf.WriteString("{")
+	for i := range h.Buckets {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		if _, err := fmt.Fprintf(&buf, "\"%d\": %d", h.Buckets[i], h.Counts[i]); err != nil {
+			return nil, err
+		}
+	}
+	buf.WriteString("}")
+
+	return buf.Bytes(), nil
+}
+
 // Nth returns the nth bucket represented as a string.
 func (bs Buckets) Nth(i int) (left, right string) {
 	if i >= len(bs)-1 {
@@ -48,10 +68,14 @@ func (bs *Buckets) UnmarshalText(value []byte) error {
 	if len(value) < 2 || value[0] != '[' || value[len(value)-1] != ']' {
 		return fmt.Errorf("bad buckets: %s", value)
 	}
-	for _, v := range strings.Split(string(value[1:len(value)-1]), ",") {
+	for i, v := range strings.Split(string(value[1:len(value)-1]), ",") {
 		d, err := time.ParseDuration(strings.TrimSpace(v))
 		if err != nil {
 			return err
+		}
+		// add a default range of [0-Buckets[0]) if needed
+		if i == 0 && d > 0 {
+			*bs = append(*bs, 0)
 		}
 		*bs = append(*bs, d)
 	}

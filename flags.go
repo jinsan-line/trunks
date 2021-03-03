@@ -3,9 +3,15 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
+
+	"github.com/c2h5oh/datasize"
+	trunks "github.com/straightdave/trunks/lib"
 )
 
 // headers is the http.Header used in each target request
@@ -56,3 +62,73 @@ func (l *csl) Set(v string) error {
 }
 
 func (l csl) String() string { return strings.Join(l, ",") }
+
+type rateFlag struct{ *trunks.Rate }
+
+func (f *rateFlag) Set(v string) (err error) {
+	if v == "infinity" {
+		return nil
+	}
+
+	ps := strings.SplitN(v, "/", 2)
+	switch len(ps) {
+	case 1:
+		ps = append(ps, "1s")
+	case 0:
+		return fmt.Errorf("-rate format %q doesn't match the \"freq/duration\" format (i.e. 50/1s)", v)
+	}
+
+	f.Freq, err = strconv.Atoi(ps[0])
+	if err != nil {
+		return err
+	}
+
+	if f.Freq == 0 {
+		return nil
+	}
+
+	switch ps[1] {
+	case "ns", "us", "µs", "ms", "s", "m", "h":
+		ps[1] = "1" + ps[1]
+	}
+
+	f.Per, err = time.ParseDuration(ps[1])
+	return err
+}
+
+func (f *rateFlag) String() string {
+	if f.Rate == nil {
+		return ""
+	}
+	return fmt.Sprintf("%d/%s", f.Freq, f.Per)
+}
+
+type maxBodyFlag struct{ n *int64 }
+
+func (f *maxBodyFlag) Set(v string) (err error) {
+	if v == "-1" {
+		*(f.n) = -1
+		return nil
+	}
+
+	var ds datasize.ByteSize
+	if err = ds.UnmarshalText([]byte(v)); err != nil {
+		return err
+	}
+
+	if ds > math.MaxInt64 {
+		return fmt.Errorf("-max-body=%d overflows int64", ds)
+	}
+
+	*(f.n) = int64(ds)
+	return nil
+}
+
+func (f *maxBodyFlag) String() string {
+	if f.n == nil {
+		return ""
+	} else if *(f.n) == -1 {
+		return "-1"
+	}
+	return datasize.ByteSize(*(f.n)).String()
+}

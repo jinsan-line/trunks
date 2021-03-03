@@ -11,37 +11,52 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"time"
 
+	"github.com/straightdave/trunks/internal/resolver"
 	trunks "github.com/straightdave/trunks/lib"
 )
 
 func attackCmd() command {
 	fs := flag.NewFlagSet("trunks attack", flag.ExitOnError)
 	opts := &attackOpts{
-		headers: headers{http.Header{}},
-		laddr:   localAddr{&trunks.DefaultLocalAddr},
+		headers:      headers{http.Header{}},
+		proxyHeaders: headers{http.Header{}},
+		laddr:        localAddr{&trunks.DefaultLocalAddr},
+		rate:         trunks.Rate{Freq: 50, Per: time.Second},
+		maxBody:      trunks.DefaultMaxBody,
 	}
-
+	fs.StringVar(&opts.name, "name", "", "Attack name")
 	fs.StringVar(&opts.targetsf, "targets", "stdin", "Targets file")
+	fs.StringVar(&opts.format, "format", trunks.HTTPTargetFormat,
+		fmt.Sprintf("Targets format [%s]", strings.Join(trunks.TargetFormats, ", ")))
 	fs.StringVar(&opts.outputf, "output", "stdout", "Output file")
 	fs.StringVar(&opts.bodyf, "body", "", "Requests body file")
+	fs.BoolVar(&opts.chunked, "chunked", false, "Send body with chunked transfer encoding")
 	fs.StringVar(&opts.certf, "cert", "", "TLS client PEM encoded certificate file")
 	fs.StringVar(&opts.keyf, "key", "", "TLS client PEM encoded private key file")
 	fs.Var(&opts.rootCerts, "root-certs", "TLS root certificate files (comma separated list)")
 	fs.BoolVar(&opts.http2, "http2", true, "Send HTTP/2 requests when supported by the server")
+	fs.BoolVar(&opts.h2c, "h2c", false, "Send HTTP/2 requests without TLS encryption")
 	fs.BoolVar(&opts.insecure, "insecure", false, "Ignore invalid server TLS certificates")
 	fs.BoolVar(&opts.lazy, "lazy", false, "Read targets lazily")
 	fs.DurationVar(&opts.duration, "duration", 0, "Duration of the test [0 = forever]")
 	fs.DurationVar(&opts.timeout, "timeout", trunks.DefaultTimeout, "Requests timeout")
-	fs.Uint64Var(&opts.rate, "rate", 50, "Requests per second")
 	fs.Uint64Var(&opts.workers, "workers", trunks.DefaultWorkers, "Initial number of workers")
+	fs.Uint64Var(&opts.maxWorkers, "max-workers", trunks.DefaultMaxWorkers, "Maximum number of workers")
 	fs.IntVar(&opts.connections, "connections", trunks.DefaultConnections, "Max open idle connections per target host")
+	fs.IntVar(&opts.maxConnections, "max-connections", trunks.DefaultMaxConnections, "Max connections per target host")
 	fs.IntVar(&opts.redirects, "redirects", trunks.DefaultRedirects, "Number of redirects to follow. -1 will not follow but marks as success")
+	fs.Var(&maxBodyFlag{&opts.maxBody}, "max-body", "Maximum number of bytes to capture from response bodies. [-1 = no limit]")
+	fs.Var(&rateFlag{&opts.rate}, "rate", "Number of requests per time unit [0 = infinity]")
 	fs.Var(&opts.headers, "header", "Request header")
+	fs.Var(&opts.proxyHeaders, "proxy-header", "Proxy CONNECT header")
 	fs.Var(&opts.laddr, "laddr", "Local IP address")
 	fs.BoolVar(&opts.keepalive, "keepalive", true, "Use persistent connections")
+	fs.StringVar(&opts.unixSocket, "unix-socket", "", "Connect over a unix socket. This overrides the host address in target URLs")
 	fs.StringVar(&opts.respf, "respf", "", "Dump responses to file")
+	systemSpecificFlags(fs, opts)
 
 	return command{fs, func(args []string) error {
 		fs.Parse(args)
@@ -50,38 +65,56 @@ func attackCmd() command {
 }
 
 var (
-	errZeroRate = errors.New("rate must be bigger than zero")
+	errZeroRate = errors.New("rate frequency and time unit must be bigger than zero")
 	errBadCert  = errors.New("bad certificate")
 )
 
 // attackOpts aggregates the attack function command options
 type attackOpts struct {
-	targetsf    string
-	outputf     string
-	bodyf       string
-	certf       string
-	keyf        string
-	rootCerts   csl
-	http2       bool
-	insecure    bool
-	lazy        bool
-	duration    time.Duration
-	timeout     time.Duration
-	rate        uint64
-	workers     uint64
-	connections int
-	redirects   int
-	headers     headers
-	laddr       localAddr
-	keepalive   bool
-	respf       string
+	name           string
+	targetsf       string
+	format         string
+	outputf        string
+	bodyf          string
+	certf          string
+	keyf           string
+	rootCerts      csl
+	http2          bool
+	h2c            bool
+	insecure       bool
+	lazy           bool
+	chunked        bool
+	duration       time.Duration
+	timeout        time.Duration
+	rate           trunks.Rate
+	workers        uint64
+	maxWorkers     uint64
+	connections    int
+	maxConnections int
+	redirects      int
+	maxBody        int64
+	headers        headers
+	proxyHeaders   headers
+	laddr          localAddr
+	keepalive      bool
+	resolvers      csl
+	unixSocket     string
+	respf          string
 }
 
 // attack validates the attack arguments, sets up the
 // required resources, launches the attack and writes the results
 func attack(opts *attackOpts) (err error) {
-	if opts.rate == 0 {
-		return errZeroRate
+	if opts.maxWorkers == trunks.DefaultMaxWorkers && opts.rate.Freq == 0 {
+		return fmt.Errorf("-rate=0 requires setting -max-workers")
+	}
+
+	if len(opts.resolvers) > 0 {
+		res, err := resolver.NewResolver(opts.resolvers)
+		if err != nil {
+			return err
+		}
+		net.DefaultResolver = res
 	}
 
 	files := map[string]io.Reader{}
@@ -105,14 +138,28 @@ func attack(opts *attackOpts) (err error) {
 	}
 
 	var (
-		tr  trunks.Targeter
-		src = files[opts.targetsf]
-		hdr = opts.headers.Header
+		tr       trunks.Targeter
+		src      = files[opts.targetsf]
+		hdr      = opts.headers.Header
+		proxyHdr = opts.proxyHeaders.Header
 	)
-	if opts.lazy {
-		tr = trunks.NewLazyTargeter(src, body, hdr)
-	} else if tr, err = trunks.NewEagerTargeter(src, body, hdr); err != nil {
-		return err
+
+	switch opts.format {
+	case trunks.JSONTargetFormat:
+		tr = trunks.NewJSONTargeter(src, body, hdr)
+	case trunks.HTTPTargetFormat:
+		tr = trunks.NewHTTPTargeter(src, body, hdr)
+	default:
+		return fmt.Errorf("format %q isn't one of [%s]",
+			opts.format, strings.Join(trunks.TargetFormats, ", "))
+	}
+
+	if !opts.lazy {
+		targets, err := trunks.ReadAllTargets(tr)
+		if err != nil {
+			return err
+		}
+		tr = trunks.NewStaticTargeter(targets...)
 	}
 
 	out, err := file(opts.outputf, true)
@@ -132,9 +179,16 @@ func attack(opts *attackOpts) (err error) {
 		trunks.LocalAddr(*opts.laddr.IPAddr),
 		trunks.TLSConfig(tlsc),
 		trunks.Workers(opts.workers),
+		trunks.MaxWorkers(opts.maxWorkers),
 		trunks.KeepAlive(opts.keepalive),
 		trunks.Connections(opts.connections),
+		trunks.MaxConnections(opts.maxConnections),
 		trunks.HTTP2(opts.http2),
+		trunks.H2C(opts.h2c),
+		trunks.MaxBody(opts.maxBody),
+		trunks.UnixSocket(opts.unixSocket),
+		trunks.ProxyHeader(proxyHdr),
+		trunks.ChunkedBody(opts.chunked),
 	)
 
 	if opts.respf != "" {
@@ -142,7 +196,7 @@ func attack(opts *attackOpts) (err error) {
 		defer atk.WaitDumpResp()
 	}
 
-	res := atk.Attack(tr, opts.rate, opts.duration)
+	res := atk.Attack(tr, opts.rate, opts.duration, opts.name)
 	enc := trunks.NewEncoder(out)
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt)
