@@ -1,6 +1,6 @@
 module github.com/straightdave/trunks
 
-go 1.15
+go 1.13
 
 require (
 	github.com/alecthomas/jsonschema v0.0.0-20180308105923-f2c93856175a
@@ -22,6 +22,8 @@ require (
 	github.com/influxdata/tdigest v0.0.0-20180711151920-a7d76c6f093a
 	github.com/mailru/easyjson v0.7.7
 	github.com/miekg/dns v1.1.17
+	github.com/shurcooL/httpfs v0.0.0-20190707220628-8d4bc4ba7749 // indirect
+	github.com/shurcooL/vfsgen v0.0.0-20200824052919-0d455de96546 // indirect
 	github.com/streadway/quantile v0.0.0-20150917103942-b0c588724d25
 	github.com/tsenart/go-tsz v0.0.0-20180814232043-cdeb9e1e981e
 	golang.org/x/net v0.0.0-20201110031124-69a78807bb2b
