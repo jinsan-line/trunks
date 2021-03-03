@@ -227,3 +227,10 @@ func (b *Burner) hit(tgt *Gtarget, tm time.Time) (res *Result) {
 	}
 	return
 }
+
+func max(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
+}
