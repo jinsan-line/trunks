@@ -4,7 +4,7 @@ DATE=$(shell date +'%FT%TZ%z')
 
 trunks: vendor generate
 	CGO_ENABLED=0 go build -v -a -tags=netgo \
-	-ldflags '-s -w -extldflags "-static" -X main.Version=$(VERSION) -X main.Commit=$(COMMIT) -X main.Date=$(DATE)'
+  	-ldflags '-s -w -extldflags "-static" -X main.Version=$(VERSION) -X main.Commit=$(COMMIT) -X main.Date=$(DATE)'
 
 clean-trunks:
 	rm trunks

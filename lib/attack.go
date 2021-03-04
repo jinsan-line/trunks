@@ -435,6 +435,7 @@ func (a *Attacker) hit(tr Targeter, name string) *Result {
 
 		res.BytesIn = uint64(len(res.Body))
 	} else {
+		// TODO vegeta 12.8.4
 		buf := &bytes.Buffer{}
 		in, err := io.Copy(buf, r.Body)
 		if err != nil {
