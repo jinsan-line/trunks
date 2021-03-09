@@ -58,29 +58,9 @@ func NewBurner(hosts []string, opts ...BurnOpt) (*Burner, error) {
 		cos = append(cos, grpc.MaxCallSendMsgSize(b.maxSend))
 	}
 
-	p := &pool{}
-
-	for _, h := range hosts {
-		var x uint64
-		for ; x < b.numConnPerHost; x++ {
-			var c *grpc.ClientConn
-			var err error
-
-			if len(cos) > 0 {
-				c, err = grpc.Dial(h, grpc.WithDefaultCallOptions(cos...), grpc.WithInsecure())
-			} else {
-				c, err = grpc.Dial(h, grpc.WithInsecure())
-			}
-
-			if err != nil {
-				return nil, fmt.Errorf("failed to dial %s: %v", h, err)
-			}
-			p.conns = append(p.conns, c)
-		}
-	}
-
-	if len(p.conns) < 1 {
-		return nil, fmt.Errorf("no connection in pool")
+	p, err := newPool(hosts, b.numConnPerHost, cos)
+	if err != nil {
+		return nil, err
 	}
 
 	b.pool = p

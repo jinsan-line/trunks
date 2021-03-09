@@ -19,6 +19,42 @@ type pool struct {
 	next  int
 }
 
+func newPool(hosts []string, numConnPerHost uint64, cos []grpc.CallOption) (*pool, error) {
+	p := &pool{}
+	err := p.connect(hosts, numConnPerHost, cos)
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+func (p *pool) connect(hosts []string, numConnPerHost uint64, cos []grpc.CallOption) error {
+	for _, h := range hosts {
+		var x uint64
+		for ; x < numConnPerHost; x++ {
+			var c *grpc.ClientConn
+			var err error
+
+			if len(cos) > 0 {
+				c, err = grpc.Dial(h, grpc.WithDefaultCallOptions(cos...), grpc.WithInsecure())
+			} else {
+				c, err = grpc.Dial(h, grpc.WithInsecure())
+			}
+
+			if err != nil {
+				return fmt.Errorf("failed to dial %s: %v", h, err)
+			}
+			p.conns = append(p.conns, c)
+		}
+	}
+
+	if len(p.conns) < 1 {
+		return fmt.Errorf("no connection in pool")
+	}
+
+	return nil
+}
+
 func (p *pool) pick() (*grpc.ClientConn, error) {
 	size := len(p.conns)
 	if size == 0 {
