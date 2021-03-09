@@ -40,9 +40,10 @@ func NewBurner(hosts []string, opts ...BurnOpt) (*Burner, error) {
 	}
 
 	b := &Burner{
-		stopch:    make(chan struct{}),
-		numWorker: DefaultWorkers,
-		ctx:       context.Background(),
+		stopch:         make(chan struct{}),
+		numWorker:      DefaultWorkers,
+		numConnPerHost: DefaultConnections,
+		ctx:            context.Background(),
 	}
 
 	for _, opt := range opts {
