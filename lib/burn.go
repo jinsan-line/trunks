@@ -20,18 +20,25 @@ func init() {
 
 // Burner is who runs the stress test against Gtargets.
 type Burner struct {
-	numWorker      uint64
+	pool           *pool
+	ctx            context.Context
+	stopch         chan struct{}
+	workers        uint64
+	maxWorkers     uint64
 	numConnPerHost uint64
+	maxRecv        int
+	maxSend        int
 	loop           bool
 	dump           bool
 	dumpFile       string
-	maxRecv        int
-	maxSend        int
-
-	pool   *pool
-	ctx    context.Context
-	stopch chan struct{}
+	seqmu          sync.Mutex
+	seq            uint64
+	began          time.Time
 }
+
+const (
+	DefaultGrpcConnections = 10000
+)
 
 // NewBurner creates a new Burner with burner options.
 func NewBurner(hosts []string, opts ...BurnOpt) (*Burner, error) {
@@ -40,10 +47,12 @@ func NewBurner(hosts []string, opts ...BurnOpt) (*Burner, error) {
 	}
 
 	b := &Burner{
-		stopch:         make(chan struct{}),
-		numWorker:      DefaultWorkers,
-		numConnPerHost: DefaultConnections,
 		ctx:            context.Background(),
+		stopch:         make(chan struct{}),
+		workers:        DefaultWorkers,
+		maxWorkers:     DefaultMaxWorkers,
+		numConnPerHost: DefaultGrpcConnections,
+		began:          time.Now(),
 	}
 
 	for _, opt := range opts {
@@ -93,35 +102,60 @@ func (b *Burner) Close() error {
 	return b.pool.close()
 }
 
-func (b *Burner) Burn(tgt *Gtarget, rate uint64, du time.Duration) <-chan *Result {
-	var workers sync.WaitGroup
+func (b *Burner) Burn(tgt *Gtarget, p Pacer, du time.Duration, name string) <-chan *Result {
+	var wg sync.WaitGroup
+
+	workers := b.workers
+	if workers > b.maxWorkers {
+		workers = b.maxWorkers
+	}
+
 	results := make(chan *Result)
-	ticks := make(chan time.Time)
-	for i := uint64(0); i < b.numWorker; i++ {
-		workers.Add(1)
-		go b.burn(tgt, &workers, ticks, results)
+	ticks := make(chan struct{})
+	for i := uint64(0); i < workers; i++ {
+		wg.Add(1)
+		go b.burn(tgt, name, &wg, ticks, results)
 	}
 
 	go func() {
 		defer close(results)
-		defer workers.Wait()
+		defer wg.Wait()
 		defer close(ticks)
-		interval := 1e9 / rate
-		hits := rate * uint64(du.Seconds())
-		began, done := time.Now(), uint64(0)
+
+		began, count := time.Now(), uint64(0)
 		for {
-			now, next := time.Now(), began.Add(time.Duration(done*interval))
-			time.Sleep(next.Sub(now))
-			select {
-			case ticks <- max(next, now):
-				if done++; done == hits {
+			elapsed := time.Since(began)
+			if du > 0 && elapsed > du {
+				return
+			}
+
+			wait, stop := p.Pace(elapsed, count)
+			if stop {
+				return
+			}
+
+			time.Sleep(wait)
+
+			if workers < b.maxWorkers {
+				select {
+				case ticks <- struct{}{}:
+					count++
+					continue
+				case <-b.stopch:
 					return
+				default:
+					// all workers are blocked. start one more and try again
+					workers++
+					wg.Add(1)
+					go b.burn(tgt, name, &wg, ticks, results)
 				}
+			}
+
+			select {
+			case ticks <- struct{}{}:
+				count++
 			case <-b.stopch:
 				return
-			default:
-				workers.Add(1)
-				go b.burn(tgt, &workers, ticks, results)
 			}
 		}
 	}()
@@ -138,23 +172,31 @@ func (b *Burner) Stop() {
 	}
 }
 
-func (b *Burner) burn(tgt *Gtarget, workers *sync.WaitGroup, ticks <-chan time.Time, results chan<- *Result) {
+func (b *Burner) burn(tgt *Gtarget, name string, workers *sync.WaitGroup, ticks <-chan struct{}, results chan<- *Result) {
 	defer workers.Done()
-	for tk := range ticks {
-		results <- b.hit(tgt, tk)
+	for range ticks {
+		results <- b.hit(tgt, name)
 	}
 }
 
-func (b *Burner) hit(tgt *Gtarget, tm time.Time) (res *Result) {
-	res = &Result{Timestamp: tm}
-	var err error
+func (b *Burner) hit(tgt *Gtarget, name string) *Result {
+	var (
+		res = Result{Attack: name}
+		err error
+	)
+
+	b.seqmu.Lock()
+	res.Timestamp = b.began.Add(time.Since(b.began))
+	res.Seq = b.seq
+	b.seq++
+	b.seqmu.Unlock()
 
 	defer func() {
 		if r := recover(); r != nil {
 			err = r.(error)
 		}
 
-		res.Latency = time.Since(tm)
+		res.Latency = time.Since(res.Timestamp)
 
 		// count failure by cheating metrics
 		// as if this is an HTTP call
@@ -173,45 +215,51 @@ func (b *Burner) hit(tgt *Gtarget, tm time.Time) (res *Result) {
 	c, err := b.pool.pick()
 	if err != nil {
 		b.Stop()
-		return
+		return &res
 	}
+
+	res.Method = tgt.MethodName
+	// TODO
+	// res.URL = tgt.URL
 
 	req, err := tgt.pick(b.loop)
 	if err != nil {
 		b.Stop()
-		return
+		return &res
 	}
 
-	if !b.dump {
-		// simply discard the response, no operation on that object
-		// so it's able to share one single response object
-		err = c.Invoke(b.ctx, tgt.MethodName, req, tgt.Response, grpc.CallContentSubtype("proto-ignore-resp"))
-	} else {
-		// clone a response object to avoid race-condition
-		bb := reflect.New(reflect.TypeOf(tgt.Response).Elem()).Interface().(proto.Message)
-		err = c.Invoke(b.ctx, tgt.MethodName, req, bb)
-		if err == nil {
-			// start a new routine to serialize and dump
-			// to avoid blocking processing
-			dumpers.Add(1)
-			go func(resp proto.Message) {
-				defer dumpers.Done()
-				bytes, err := json.Marshal(resp)
-				if err == nil {
-					memBufMutex.Lock()
-					defer memBufMutex.Unlock()
-					bytes = append(bytes, []byte{'\r', '\n'}...)
-					memBuf.Write(bytes)
-				}
-			}(bb)
-		}
+	// clone a response object to avoid race-condition
+	resp := reflect.New(reflect.TypeOf(tgt.Response).Elem()).Interface().(proto.Message)
+	err = c.Invoke(b.ctx, tgt.MethodName, req, resp)
+	if err != nil {
+		return &res
 	}
-	return
-}
 
-func max(a, b time.Time) time.Time {
-	if a.After(b) {
-		return a
+	res.Body, err = proto.Marshal(resp)
+	if err != nil {
+		return &res
 	}
-	return b
+
+	if b.dump {
+		// start a new routine to serialize and dump
+		// to avoid blocking processing
+		dumpers.Add(1)
+		go func(resp proto.Message) {
+			defer dumpers.Done()
+			bytes, err := json.Marshal(resp)
+			if err == nil {
+				memBufMutex.Lock()
+				defer memBufMutex.Unlock()
+				bytes = append(bytes, []byte{'\r', '\n'}...)
+				memBuf.Write(bytes)
+			}
+		}(resp)
+	}
+
+	// TODO optimize performance
+	// TODO optimize performance
+	res.BytesOut = uint64(proto.Size(req))
+	res.BytesIn = uint64(proto.Size(resp))
+
+	return &res
 }
