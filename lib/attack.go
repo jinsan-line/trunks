@@ -421,36 +421,28 @@ func (a *Attacker) hit(tr Targeter, name string) *Result {
 	}
 	defer r.Body.Close()
 
-	if a.respf == "" {
-		body := io.Reader(r.Body)
-		if a.maxBody >= 0 {
-			body = io.LimitReader(r.Body, a.maxBody)
-		}
+	body := io.Reader(r.Body)
+	if a.maxBody >= 0 {
+		body = io.LimitReader(r.Body, a.maxBody)
+	}
 
-		if res.Body, err = ioutil.ReadAll(body); err != nil {
-			return &res
-		} else if _, err = io.Copy(ioutil.Discard, r.Body); err != nil {
-			return &res
-		}
+	if res.Body, err = ioutil.ReadAll(body); err != nil {
+		return &res
+	} else if _, err = io.Copy(ioutil.Discard, r.Body); err != nil {
+		return &res
+	}
 
-		res.BytesIn = uint64(len(res.Body))
-	} else {
-		// TODO vegeta 12.8.4
-		buf := &bytes.Buffer{}
-		in, err := io.Copy(buf, r.Body)
-		if err != nil {
-			return &res
-		}
-		res.BytesIn = uint64(in)
+	res.BytesIn = uint64(len(res.Body))
 
+	if a.respf != "" {
 		dumpers.Add(1)
-		go func(b *bytes.Buffer) {
+		go func(bz []byte) {
 			defer dumpers.Done()
 			memBufMutex.Lock()
 			defer memBufMutex.Unlock()
-			memBuf.Write(b.Bytes())
+			memBuf.Write(bz)
 			memBuf.WriteString("\r\n\r\n")
-		}(buf)
+		}(res.Body)
 	}
 
 	if req.ContentLength != -1 {
